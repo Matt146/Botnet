@@ -159,6 +159,7 @@ func (s *Server) HandleJoin(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			w.Write(responseSerialized)
+			return
 		}
 
 		// Add the client to the network
