@@ -49,6 +49,7 @@ type HTTPRequest struct {
 // to be ran by the client
 type Task struct {
 	Requests []HTTPRequest `json:"Requests"`
+	Times    uint32        `json:"Times"` // the number of times to send the requests
 }
 
 // Client - Struct to store info about clients and their states
