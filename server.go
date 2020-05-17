@@ -38,11 +38,11 @@ type Server struct {
 // HTTPRequest - My own HTTP struct, so I can serialize
 // http requests
 type HTTPRequest struct {
-	Method string              `json:"Method"`
-	Host   string              `json:"Host"` // this is in the format of ip:port
-	Path   string              `json:"Path"`
-	Header map[string][]string `json:"Header"`
-	Body   []byte              `json:"Body"`
+	Method  string              `json:"Method"`
+	Host    string              `json:"Host"` // this is in the format of ip:port
+	Path    string              `json:"Path"`
+	Headers map[string][]string `json:"Header"`
+	Body    []byte              `json:"Body"`
 }
 
 // Task - This contains the data pertaining to a certain task
@@ -194,6 +194,7 @@ func (s *Server) HandleDone(w http.ResponseWriter, r *http.Request) {
 	mux.Lock()
 	defer mux.Unlock()
 	if r.Method == "POST" {
+		// Determine the tasks the client finished and remove them
 		requestData := ParseRequest(r)
 		TaskIDsSplit := strings.Split(requestData.Message, ",")
 		for _, doneTaskID := range TaskIDsSplit {
@@ -278,6 +279,13 @@ func (s *Server) UploadTask(t *Task) error {
 	}
 
 	return nil
+}
+
+// CheckClients - This should be called every once in a while
+// to check if the clients are still connected. The way it works is
+// that it sends a ping request to all the connected clients
+func (s *Server) CheckClients() {
+	// @TODO
 }
 
 // PrintHelp - prints the help message after typing in the help command into the terminal
