@@ -13,7 +13,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+var mux sync.Mutex
 
 const (
 	// ClientPort - This is the port where the client server is hosted on
@@ -58,11 +61,11 @@ type Client struct {
 // Request - Struct to store every attribute of a request. Put this into JSON
 // into POST request and send it off the client to parse
 type Request struct {
-	Type          string
-	ID            string
-	Message       string // transmit a string message
-	MessageBinary []byte // transmit binary data (encode to base64)
-	Version       string
+	Type          string `json:"Type"`
+	ID            string `json:"ID"`
+	Message       string `json:"Message"`       // transmit a string message
+	MessageBinary []byte `json:"MessageBinary"` // transmit binary data (encode to base64)
+	Version       string `json:"Version"`
 }
 
 // GenerateRandomString - Used to generate a cryptographically-secure
@@ -109,9 +112,55 @@ func ParseRequest(r *http.Request) *Request {
 	return &Request{Type: rType, ID: rID, Message: rMessage, MessageBinary: rMessageBinary, Version: rVersion}
 }
 
+// SerializeRequest - This turns a protocol request into a
+// byte stream to be sent as a response to a request
+func SerializeRequest(r *Request) ([]byte, error) {
+	data, err := json.Marshal(r)
+	if err != nil {
+		return []byte(""), err
+	}
+	return data, nil
+}
+
+// IsValidClientID - Checks to see if the submitted client ID is valid
+// If it is, it returns true. If it isn't, it returns valse.
+// It does this by checking if the ID is registered with the server
+func (s *Server) IsValidClientID(ID string) bool {
+	if _, ok := s.Clients[ID]; ok {
+		return true
+	}
+	return false
+}
+
 // HandleJoin - This is the API path used to handle a new client joining the network
 func (s *Server) HandleJoin(w http.ResponseWriter, r *http.Request) {
+	mux.Lock()
+	defer mux.Unlock()
 	if r.Method == "POST" {
+		// Parse the request
+		request := ParseRequest(r)
+
+		// Check to see if the client is using an outdated or different version
+		if request.Version != Version {
+			log.Println("[Error - Nonfatal] Client using an outdated version")
+			log.Println("\tIssuing update response")
+
+			// Since the client is using an outdated version, we respond to their
+			// join request by sending a request telling them to update their version
+			response := Request{Type: "UPDATE", ID: "0", Message: "Please update your client to continue.",
+				MessageBinary: []byte(""), Version: Version}
+			responseSerialized, err := SerializeRequest(&response)
+			if err != nil {
+				// If we can't serialize the request, we just return an error
+				log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+				log.Println("\tReturning with StatusInternalServerError (500)")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Error"))
+				return
+			}
+			w.Write(responseSerialized)
+		}
+
 		// Add the client to the network
 		id, err := GenerateRandomString(ClientIDLen)
 		if err != nil {
@@ -120,36 +169,98 @@ func (s *Server) HandleJoin(w http.ResponseWriter, r *http.Request) {
 		_clientIP := r.RemoteAddr
 		clientIP := strings.Split(_clientIP, ":")[0]
 		newClient := Client{IP: clientIP, ID: id, Tasks: make(map[uint32]Task)}
-		s.Clients[id] = newClient
 
 		// Send a response to the client
 		// This response just assigns the client to an ID
 		// by sending it a JOIN-RESP with the ID in the Message field
-		http.PostForm(clientIP+ClientPort, url.Values{"Type": {"JOIN-RESP"}, "ID": {"0"},
-			"Message": {id}, "MessageBinary": {""}, "Version": {"0.0.1"}})
+		response := Request{Type: "JOIN-RESP", ID: "0", Message: id, MessageBinary: []byte(""), Version: Version}
+		responseSerialized, err := SerializeRequest(&response)
+		if err != nil {
+			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+			log.Println("\tReturning with StatusInternalServerError (500)")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("Error"))
+			return
+		}
+		w.Write(responseSerialized)
+		s.Clients[id] = newClient
 	}
 }
 
 // HandleDone - Handle when a client tells us its done with a task
 func (s *Server) HandleDone(w http.ResponseWriter, r *http.Request) {
+	mux.Lock()
+	defer mux.Unlock()
 	if r.Method == "POST" {
 		requestData := ParseRequest(r)
 		TaskIDsSplit := strings.Split(requestData.Message, ",")
 		for _, doneTaskID := range TaskIDsSplit {
 			doneTaskIDToUint64, err := strconv.ParseUint(doneTaskID, 10, 32)
 			if err != nil {
+				log.Println("[Error - Nonfatal] Unable to deserialize doneTaskID to uint64")
+				log.Println("\tReturning with StatusInternalServerError (500)")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Error"))
 				return
 			}
 			delete(s.Clients[requestData.ID].Tasks, uint32(doneTaskIDToUint64))
 		}
+
+		// Respond to the client with a success
+		response := Request{Type: "DONE-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+		responseSerialized, err := SerializeRequest(&response)
+		if err != nil {
+			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+			log.Println("\tReturning with StatusInternalServerError (500)")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("Error"))
+			return
+		}
+		w.Write(responseSerialized)
 	}
 }
 
 // HandleDisconnect - Handle a client disconnecting
 func (s *Server) HandleDisconnect(w http.ResponseWriter, r *http.Request) {
+	mux.Lock()
+	defer mux.Unlock()
 	if r.Method == "POST" {
 		requestData := ParseRequest(r)
 		delete(s.Clients, requestData.ID)
+	}
+	response := Request{Type: "DISCONNECT-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+	responseSerialized, err := SerializeRequest(&response)
+	if err != nil {
+		log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+		log.Println("\tReturning with StatusInternalServerError (500)")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Error"))
+		return
+	}
+	w.Write(responseSerialized)
+}
+
+// HandlePing - Handles the /ping api path. When a client pings the server,
+// they should receive a pong request as a response
+func (s *Server) HandlePing(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		response := Request{Type: "PONG", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+		responseSerialized, err := SerializeRequest(&response)
+		if err != nil {
+			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+			log.Println("\tReturning with StatusInternalServerError (500)")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("Error"))
+			return
+		}
+		w.Write(responseSerialized)
+	}
+}
+
+// HandlePong - Handles the /pong api path
+func (s *Server) HandlePong(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		// @TODO: implement later
 	}
 }
 
@@ -160,8 +271,8 @@ func (s *Server) UploadTask(t *Task) error {
 		if err != nil {
 			return err
 		}
-		http.PostForm(v.IP+ClientPort+"/uploadtask", url.Values{"Type": {"JOIN-RESP"}, "ID": {"0"},
-			"Message": {tasksSerialized}, "MessageBinary": {""}, "Version": {"0.0.1"}})
+		http.PostForm(v.IP+ClientPort+"/uploadtask", url.Values{"Type": {"UPLOADTASK"}, "ID": {"0"},
+			"Message": {tasksSerialized}, "MessageBinary": {""}, "Version": {Version}})
 	}
 
 	return nil
@@ -195,6 +306,8 @@ func GetUserInput(cwd string) string {
 
 // ListClients - Used to print all clients out to the command line
 func (s *Server) ListClients() {
+	mux.Lock()
+	defer mux.Unlock()
 	count := 0
 	for k, v := range s.Clients {
 		fmt.Printf("\n\t[%d] ID: %s | IP: %s\n", count, k, v.IP)
@@ -204,6 +317,8 @@ func (s *Server) ListClients() {
 
 // ListClientsAll - Same as ListClients but displays more information
 func (s *Server) ListClientsAll() {
+	mux.Lock()
+	defer mux.Unlock()
 	count := 0
 	for k, v := range s.Clients {
 		fmt.Printf("\n\t[%d] ID: %s | IP: %s\n", count, k, v.IP)
@@ -288,6 +403,8 @@ func main() {
 	http.HandleFunc("/join", s.HandleJoin)
 	http.HandleFunc("/done", s.HandleDone)
 	http.HandleFunc("/disconnect", s.HandleDisconnect)
+	http.HandleFunc("/ping", s.HandlePing)
+	http.HandleFunc("/pong", s.HandlePong)
 	go http.ListenAndServe(":80", nil)
 	s.HandleUserInput()
 }
