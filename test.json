@@ -1,0 +1,11 @@
+{
+    "Requests": [
+        {
+            "Method": "GET",
+            "Host": "https://www.google.com",
+            "Path": "/",
+            "Headers": {},
+            "Body": ""
+        }
+    ]
+}
