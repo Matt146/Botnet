@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -60,9 +62,10 @@ type Task struct {
 
 // Client - Struct to store info about clients and their states
 type Client struct {
-	IP    string
-	ID    string
-	Tasks map[uint32]Task
+	IP     string
+	ID     string
+	Tasks  map[uint32]Task
+	HMACSK []byte
 }
 
 // Request - Struct to store every attribute of a request.
@@ -72,8 +75,9 @@ type Request struct {
 	Type          string `json:"Type"`
 	ID            string `json:"ID"`
 	Message       string `json:"Message"`       // transmit a string message
-	MessageBinary []byte `json:"MessageBinary"` // transmit binary data (encode to base64)
+	MessageBinary []byte `json:"MessageBinary"` // transmit binary data (encode to base64 URL encoding)
 	Version       string `json:"Version"`
+	HMACHash      []byte `json:"HMACHash"`
 }
 
 // GenerateRandomString - Used to generate a cryptographically-secure
@@ -109,15 +113,21 @@ func ParseRequest(r *http.Request) *Request {
 	rMessage := r.FormValue("Message")
 	rMesssageBinaryUnparsed := r.FormValue("MessageBinary")
 	rVersion := r.FormValue("Version")
+	rHMACHashUnparsed := r.FormValue("HMACHash")
 
 	// Change necessary types into their correct types
 	rMessageBinary, err := base64.URLEncoding.DecodeString(rMesssageBinaryUnparsed)
 	if err != nil {
 		return nil
 	}
+	rHMACHash, err := base64.URLEncoding.DecodeString(rHMACHashUnparsed)
+	if err != nil {
+		fmt.Println(err.Error())
+		return nil
+	}
 
 	// Use these to return an http.Request correctly
-	return &Request{Type: rType, ID: rID, Message: rMessage, MessageBinary: rMessageBinary, Version: rVersion}
+	return &Request{Type: rType, ID: rID, Message: rMessage, MessageBinary: rMessageBinary, Version: rVersion, HMACHash: rHMACHash}
 }
 
 // SerializeProtocolRequest - This turns a protocol request into a
@@ -149,6 +159,62 @@ func (s *Server) IsValidClientID(ID string) bool {
 		return true
 	}
 	return false
+}
+
+// HMACGenKey - Generates an HMAC secret key of sufficient length
+// for HMAC-SHA256
+func HMACGenKey() ([]byte, error) {
+	n := 64
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	// Note that err == nil only if we read len(b) bytes.
+	if err != nil {
+		return []byte(""), err
+	}
+
+	return b, nil
+}
+
+// HMACHash - Generates HMAC-SHA256 hash of
+// parameters, "msg" using parameter "key".
+// Returns raw bytes of expected HMAC
+func HMACHash(key []byte, msg []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(msg)
+	expectedMAC := mac.Sum(nil)
+	return expectedMAC
+}
+
+// HMACHashRequest - Generates the HMAC hash of a request
+// and returns a byte representation of it
+func HMACHashRequest(key []byte, r *Request) []byte {
+	data := []byte(r.Type + r.ID + r.Message + base64.URLEncoding.EncodeToString(r.MessageBinary) + r.Version)
+	hash := HMACHash(key, data)
+	return hash
+}
+
+// HMACValidateRequest - Validates the HMAC hash of a
+// request by comparing it to the stored secret key.
+// Returns true if the HMAC is valid
+// Returns false if the HMAC is not valid
+func (s *Server) HMACValidateRequest(r *Request) bool {
+	expected := HMACHashRequest(s.Clients[r.ID].HMACSK, r)
+	return hmac.Equal(expected, r.HMACHash)
+}
+
+// IsValidRequest - Checks for two things:
+// - Client is registered
+// - Client is who he says he is by checking the HMAC hashes
+// Returns true if the request is valid
+// Returns false if the request is not valid
+func (s *Server) IsValidRequest(r *Request) bool {
+	if _, ok := s.Clients[r.ID]; ok == false {
+		return false
+	}
+	if s.HMACValidateRequest(r) == false {
+		return false
+	}
+	return true
 }
 
 // HandleJoin - This is the API path used to handle a new client joining the network
@@ -188,12 +254,16 @@ func (s *Server) HandleJoin(w http.ResponseWriter, r *http.Request) {
 		}
 		_clientIP := r.RemoteAddr
 		clientIP := strings.Split(_clientIP, ":")[0]
-		newClient := Client{IP: clientIP, ID: id, Tasks: make(map[uint32]Task)}
+		clientHMACSK, err := HMACGenKey()
+		if err != nil {
+			return
+		}
+		newClient := Client{IP: clientIP, ID: id, Tasks: make(map[uint32]Task), HMACSK: clientHMACSK}
 
 		// Send a response to the client
 		// This response just assigns the client to an ID
 		// by sending it a JOIN-RESP with the ID in the Message field
-		response := Request{Type: "JOIN-RESP", ID: "0", Message: id, MessageBinary: []byte(""), Version: Version}
+		response := Request{Type: "JOIN-RESP", ID: "0", Message: id, MessageBinary: clientHMACSK, Version: Version}
 		responseSerialized, err := SerializeProtocolRequest(&response)
 		if err != nil {
 			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
@@ -214,30 +284,39 @@ func (s *Server) HandleDone(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		// Determine the tasks the client finished and remove them
 		requestData := ParseRequest(r)
-		TaskIDsSplit := strings.Split(requestData.Message, ",")
-		for _, doneTaskID := range TaskIDsSplit {
-			doneTaskIDToUint64, err := strconv.ParseUint(doneTaskID, 10, 32)
-			if err != nil {
-				log.Println("[Error - Nonfatal] Unable to deserialize doneTaskID to uint64")
-				log.Println("\tReturning with StatusInternalServerError (500)")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte("Error"))
-				return
-			}
-			delete(s.Clients[requestData.ID].Tasks, uint32(doneTaskIDToUint64))
-		}
+		if s.IsValidRequest(requestData) {
+			TaskIDsSplit := strings.Split(requestData.Message, ",")
+			if s.IsValidRequest(requestData) {
+				for _, doneTaskID := range TaskIDsSplit {
+					doneTaskIDToUint64, err := strconv.ParseUint(doneTaskID, 10, 32)
+					if err != nil {
+						log.Println("[Error - Nonfatal] Unable to deserialize doneTaskID to uint64")
+						log.Println("\tReturning with StatusInternalServerError (500)")
+						w.WriteHeader(http.StatusInternalServerError)
+						w.Write([]byte("Error"))
+						return
+					}
+					delete(s.Clients[requestData.ID].Tasks, uint32(doneTaskIDToUint64))
+				}
 
-		// Respond to the client with a success
-		response := Request{Type: "DONE-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
-		responseSerialized, err := SerializeProtocolRequest(&response)
-		if err != nil {
-			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
-			log.Println("\tReturning with StatusInternalServerError (500)")
-			w.WriteHeader(http.StatusInternalServerError)
+				// Respond to the client with a success
+				response := Request{Type: "DONE-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+				hmacHash := HMACHashRequest(s.Clients[requestData.ID].HMACSK, &response)
+				response.HMACHash = hmacHash
+				responseSerialized, err := SerializeProtocolRequest(&response)
+				if err != nil {
+					log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+					log.Println("\tReturning with StatusInternalServerError (500)")
+					w.WriteHeader(http.StatusInternalServerError)
+					w.Write([]byte("Error"))
+					return
+				}
+				w.Write(responseSerialized)
+			}
+		} else {
+			w.WriteHeader(http.StatusForbidden)
 			w.Write([]byte("Error"))
-			return
 		}
-		w.Write(responseSerialized)
 	}
 }
 
@@ -247,17 +326,28 @@ func (s *Server) HandleDisconnect(w http.ResponseWriter, r *http.Request) {
 	defer mux.Unlock()
 	if r.Method == "POST" {
 		requestData := ParseRequest(r)
-		delete(s.Clients, requestData.ID)
-		response := Request{Type: "DISCONNECT-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
-		responseSerialized, err := SerializeProtocolRequest(&response)
-		if err != nil {
-			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
-			log.Println("\tReturning with StatusInternalServerError (500)")
-			w.WriteHeader(http.StatusInternalServerError)
+		if s.IsValidRequest(requestData) {
+			if s.IsValidRequest(requestData) {
+				if s.IsValidRequest(requestData) {
+					delete(s.Clients, requestData.ID)
+					response := Request{Type: "DISCONNECT-RESP", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+					hmacHash := HMACHashRequest(s.Clients[requestData.ID].HMACSK, &response)
+					response.HMACHash = hmacHash
+					responseSerialized, err := SerializeProtocolRequest(&response)
+					if err != nil {
+						log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+						log.Println("\tReturning with StatusInternalServerError (500)")
+						w.WriteHeader(http.StatusInternalServerError)
+						w.Write([]byte("Error"))
+						return
+					}
+					w.Write(responseSerialized)
+				}
+			}
+		} else {
+			w.WriteHeader(http.StatusForbidden)
 			w.Write([]byte("Error"))
-			return
 		}
-		w.Write(responseSerialized)
 	}
 }
 
@@ -265,16 +355,24 @@ func (s *Server) HandleDisconnect(w http.ResponseWriter, r *http.Request) {
 // they should receive a pong request as a response
 func (s *Server) HandlePing(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
-		response := Request{Type: "PONG", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
-		responseSerialized, err := SerializeProtocolRequest(&response)
-		if err != nil {
-			log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
-			log.Println("\tReturning with StatusInternalServerError (500)")
-			w.WriteHeader(http.StatusInternalServerError)
+		requestData := ParseRequest(r)
+		if s.IsValidRequest(requestData) {
+			response := Request{Type: "PONG", ID: "0", Message: "Success", MessageBinary: []byte(""), Version: Version}
+			hmacHash := HMACHashRequest(s.Clients[requestData.ID].HMACSK, &response)
+			response.HMACHash = hmacHash
+			responseSerialized, err := SerializeProtocolRequest(&response)
+			if err != nil {
+				log.Println("[Error - Nonfatal] Unable to serialize response to send to client")
+				log.Println("\tReturning with StatusInternalServerError (500)")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte("Error"))
+				return
+			}
+			w.Write(responseSerialized)
+		} else {
+			w.WriteHeader(http.StatusForbidden)
 			w.Write([]byte("Error"))
-			return
 		}
-		w.Write(responseSerialized)
 	}
 }
 
@@ -285,13 +383,18 @@ func (s *Server) UploadTask(t *Task) error {
 		if err != nil {
 			return err
 		}
+		response := Request{Type: "UPLOADTASK", ID: "0",
+			Message: tasksSerialized, MessageBinary: []byte(""), Version: Version}
+		hmacHash := HMACHashRequest(v.HMACSK, &response)
+		hmacHashBase64 := base64.URLEncoding.EncodeToString(hmacHash)
+
 		_, err = http.PostForm("http://"+v.IP+ClientPort+"/uploadtask", url.Values{"Type": {"UPLOADTASK"}, "ID": {"0"},
-			"Message": {tasksSerialized}, "MessageBinary": {""}, "Version": {Version}})
+			"Message": {tasksSerialized}, "MessageBinary": {""}, "Version": {Version},
+			"HMACHash": {hmacHashBase64}})
 		if err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -299,15 +402,22 @@ func (s *Server) UploadTask(t *Task) error {
 // Returns true if a client successfully responded with a PONG
 func (s *Server) PingClient(clientID string) bool {
 	// Create an HTTP request to ping the client
+	response := Request{Type: "PING", ID: "0",
+		Message: "", MessageBinary: []byte(""), Version: Version}
+	hmacHash := HMACHashRequest(s.Clients[clientID].HMACSK, &response)
+	hmacHashBase64 := base64.URLEncoding.EncodeToString(hmacHash)
+
 	formValues := url.Values{"Type": {"PING"}, "ID": {"0"},
-		"Message": {""}, "MessageBinary": {""}, "Version": {Version}}
+		"Message": {""}, "MessageBinary": {""}, "Version": {Version},
+		"HMACHash": {hmacHashBase64}}
 	url := "http://" + s.Clients[clientID].IP + ClientPort + "/ping"
-	fmt.Println(url)
 	client := &http.Client{Timeout: PingTimeout}
 	req, err := http.NewRequest("POST", url, strings.NewReader(formValues.Encode()))
 	if err != nil {
 		return false
 	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Content-Length", strconv.Itoa(len(formValues.Encode())))
 
 	// Actually do the request
 	resp, err := client.Do(req)
@@ -360,6 +470,7 @@ func PrintHelp() {
 	fmt.Println("\t - list: List all clients")
 	fmt.Println("\t - list-all: Lists all clients and their tasks")
 	fmt.Println("\t - count: Prints out the number of currently-connected clients")
+	fmt.Println("\t - ping: Pings all clients and automatically removes idle ones")
 	fmt.Printf("\n\n")
 }
 
@@ -464,6 +575,8 @@ func (s *Server) HandleUserInput() {
 				log.Println("\tCorrect usage: upload-task <path-to-task-file>")
 				continue
 			}
+		case "ping":
+			s.PingAllClients()
 		default:
 			fmt.Printf("\nTry typing \"help\" in order to view the list of possible commands\n\n")
 		}
@@ -485,7 +598,7 @@ func main() {
 	http.HandleFunc("/done", s.HandleDone)
 	http.HandleFunc("/disconnect", s.HandleDisconnect)
 	http.HandleFunc("/ping", s.HandlePing)
-	go http.ListenAndServe(":80", nil)
+	go http.ListenAndServe(":8080", nil) // TODO: BUG: doesen't detect if there is an error listening
 	go RunCronJobs(&s)
 	s.HandleUserInput()
 }
